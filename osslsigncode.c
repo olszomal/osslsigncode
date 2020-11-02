@@ -1339,7 +1339,8 @@ typedef enum {
 	FILE_TYPE_CAB,
 	FILE_TYPE_PE,
 	FILE_TYPE_MSI,
-	FILE_TYPE_CAT
+	FILE_TYPE_CAT,
+	FILE_TYPE_TXT
 } file_type_t;
 
 typedef enum {
@@ -1518,6 +1519,10 @@ static void get_indirect_data_blob(u_char **blob, int *len, GLOBAL_OPTIONS *opti
 		0xf1, 0x10, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46
 	};
+	static const unsigned char txtstr[] = {
+		0x1f, 0xcc, 0x3b, 0x60, 0x59, 0x4b, 0x08, 0x4e,
+		0xb7, 0x24, 0xd2, 0xc6, 0x29, 0x7e, 0xf3, 0x51
+	};
 
 	idc = SpcIndirectDataContent_new();
 	idc->data->value = ASN1_TYPE_new();
@@ -1557,6 +1562,21 @@ static void get_indirect_data_blob(u_char **blob, int *len, GLOBAL_OPTIONS *opti
 		ASN1_INTEGER_set(si->e, 0);
 		ASN1_INTEGER_set(si->f, 0);
 		ASN1_OCTET_STRING_set(si->string, msistr, sizeof(msistr));
+		l = i2d_SpcSipInfo(si, NULL);
+		p = OPENSSL_malloc(l);
+		i2d_SpcSipInfo(si, &p);
+		p -= l;
+		dtype = OBJ_txt2obj(SPC_SIPINFO_OBJID, 1);
+		SpcSipInfo_free(si);
+	} else if (type == FILE_TYPE_TXT) {
+		SpcSipInfo *si = SpcSipInfo_new();
+		ASN1_INTEGER_set(si->a, 0x10000);
+		ASN1_INTEGER_set(si->b, 0);
+		ASN1_INTEGER_set(si->c, 0);
+		ASN1_INTEGER_set(si->d, 0);
+		ASN1_INTEGER_set(si->e, 0);
+		ASN1_INTEGER_set(si->f, 0);
+		ASN1_OCTET_STRING_set(si->string, txtstr, sizeof(txtstr));
 		l = i2d_SpcSipInfo(si, NULL);
 		p = OPENSSL_malloc(l);
 		i2d_SpcSipInfo(si, &p);
@@ -4306,6 +4326,550 @@ out:
 	return ret;
 }
 
+/*
+ * Text / Powershell scripts file (ps1) support
+ */
+
+static const u_char utf8_bom[] = {0xef, 0xbb, 0xbf};
+static const u_char utf16_bom[] = {0xff, 0xfe};
+
+ /*
+  * Simple heuristics which won't work for roman alphabets
+  * we check no more than a 16th of characters are non-ascii
+  */
+
+static int is_txt(char *_data, size_t len)
+{
+	unsigned char *data = (unsigned char *) _data;
+	unsigned n = 0;
+	unsigned h = 0;
+
+	while (len--) {
+		if ((*data & 0x80) || (!*data))
+			h++;
+		n++;
+		data++;
+	}
+	n = n / 16;
+	if (h > n)
+		return 0;
+
+	return 1;
+}
+
+static int is_utf16_txt(char *indata, size_t len)
+{
+	u_char *data = (u_char *)indata;
+	unsigned n = 0;
+	unsigned h = 0;
+
+	len &=~1;
+	while (len--) {
+		if ((*data & 0x80) || (!*data))
+			h++;
+		n++;
+		data++;
+		len--;
+		if (*data)
+			h++;
+		data++;
+	}
+	n = n / 16;
+	if (h > n)
+		return 0;
+
+	return 1;
+}
+
+/* https://www.gnu.org/software/libc/manual/html_node/iconv-Examples.html */
+static int txt_to_utf16(char *indata, size_t fileend, unsigned short **utf16_buf, size_t *utf16_len)
+{
+	size_t iconv_inlen;
+	size_t iconv_outlen;
+	size_t iconv_outbuflen;
+	char *iconv_inbuf;
+	char *iconv_outbuf;
+	iconv_t cd = (iconv_t) - 1;
+
+	if (!memcmp(indata, utf16_bom, sizeof(utf16_bom))) {
+		cd = iconv_open("UTF-16LE", "UTF-16LE");
+	} else if (is_utf16_txt(indata, fileend)) {
+		/* ??? */
+		cd = iconv_open("UTF-16", "UTF-16");
+	} else if (!memcmp(indata, utf8_bom, sizeof(utf8_bom))) {
+		cd = iconv_open("UTF-16LE", "UTF-8");
+	} else {
+		/*
+		UTF-8 text - guess it's CP1251
+			Windows10 - error -> UTF-16BE FE FF
+			Fedora    - works -> UTF-16LE FF FE
+		*/
+		cd = iconv_open("UTF-16", "CP1251");
+		/*
+		try UTF-16LE -> utf16_txt (without BOM)
+		cd = iconv_open("UTF-16LE", "CP1251");
+		*/
+	}
+	if (cd == (iconv_t) - 1) {
+		printf("iconv_open failed\n");
+		return 0;
+	}
+
+	iconv_inlen = fileend;
+	iconv_outlen = iconv_outbuflen = fileend * 3;
+
+	*utf16_buf = malloc(iconv_outbuflen);
+	iconv_inbuf = indata;
+	iconv_outbuf = (char *)*utf16_buf;
+
+	if (iconv(cd, (void *)&iconv_inbuf, &iconv_inlen, &iconv_outbuf, &iconv_outlen)) {
+		printf("Converting to UTF-16 threw an error.\n");
+		return 0;
+	}
+	*utf16_len = iconv_outbuflen - iconv_outlen;  /* yes really! */
+	iconv_close(cd);
+
+	return 1;
+}
+
+static int txt_hash(BIO *hash, unsigned short *utf16_buf, size_t utf16_len)
+{
+	int last_was_cr = 0;
+	unsigned i, lineptr = 0;
+	unsigned short *linebuf;
+
+	linebuf = malloc(utf16_len + 4);
+	if (!linebuf) {
+		printf ("Failed to allocate line buffer.\n");
+		return 0;
+	}
+
+	for (i = 0; i < (utf16_len >> 1); i++) {
+		switch (utf16_buf[i]) {
+		case L'\n':
+			if (!last_was_cr)
+				linebuf[lineptr++] = L'\r';
+			linebuf[lineptr++] = L'\n';
+			BIO_write (hash, linebuf, lineptr * 2);
+			lineptr = 0;
+			last_was_cr = 0;
+			break;
+		case L'\r':
+			last_was_cr = 1;
+			linebuf[lineptr++] = L'\r';
+			break;
+		default:
+			last_was_cr = 0;
+			linebuf[lineptr++] = utf16_buf[i];
+		}
+	}
+
+	if (lineptr) {
+		if (!last_was_cr)
+			linebuf[lineptr++] = L'\r';
+		linebuf[lineptr++] = L'\n';
+		BIO_write (hash, linebuf, lineptr * 2);
+	}
+	free (linebuf);
+	(void) BIO_flush (hash);
+	return 1;
+}
+
+static size_t txt_find_sig_start(char *data, size_t len, int utf16)
+{
+	static char delimiter_8[] = {
+		'\r', '\n', '#', ' ', 'S', 'I', 'G', ' ', '#', ' ', 'B',
+		'e', 'g', 'i', 'n', ' ', 's', 'i', 'g', 'n', 'a', 't', 'u', 'r',
+		'e', ' ', 'b', 'l', 'o', 'c', 'k'
+	};
+	static short delimiter_16[] = {
+		'\r', '\n', '#', ' ', 'S', 'I', 'G', ' ', '#', ' ', 'B',
+		'e', 'g', 'i', 'n', ' ', 's', 'i', 'g', 'n', 'a', 't', 'u', 'r',
+		'e', ' ', 'b', 'l', 'o', 'c', 'k'
+	};
+	void *delimiter =
+		utf16 ? (void *)delimiter_16 : (void *)delimiter_8;
+	size_t delimiter_len =
+		utf16 ? sizeof(delimiter_16) : sizeof(delimiter_8);
+	size_t ret;
+
+	if (len <= delimiter_len)
+		return 0;
+	len -= delimiter_len;
+	for (ret = 0; ret < len; ++ret) {
+		if (!memcmp(&data[ret], delimiter, delimiter_len))
+			return ret;
+	}
+	return 0;
+}
+
+static size_t txt_find_sig_end(char *data, size_t len, int utf16)
+{
+	static char delimiter_8[] = {
+		'\r', '\n', '#', ' ', 'S', 'I', 'G', ' ', '#', ' ', 'E',
+		'n', 'd', ' ', 's', 'i', 'g', 'n', 'a', 't', 'u', 'r', 'e', ' ',
+		'b', 'l', 'o', 'c', 'k'
+	};
+	static short delimiter_16[] = {
+		'\r', '\n', '#', ' ', 'S', 'I', 'G', ' ', '#', ' ', 'E',
+		'n', 'd', ' ', 's', 'i', 'g', 'n', 'a', 't', 'u', 'r', 'e', ' ',
+		'b', 'l', 'o', 'c', 'k'
+	};
+	void *delimiter =
+		utf16 ? (void *)delimiter_16 : (void *)delimiter_8;
+	size_t delimiter_len =
+		utf16 ? sizeof(delimiter_16) : sizeof(delimiter_8);
+	size_t ret;
+
+	if (len <= delimiter_len)
+		return 0;
+	len -= delimiter_len;
+	for (ret = 0; ret < len; ++ret) {
+		if (!memcmp(&data[ret], delimiter, delimiter_len))
+			return ret + delimiter_len + (utf16 ? 4 : 2);
+	}
+
+	return 0;
+}
+
+static int txt_verify_header(char *indata, char *infile, size_t filesize, FILE_HEADER *header)
+{
+	int ret = 1;
+	size_t pre, post;
+	int utf16 = !memcmp(indata, utf16_bom, sizeof(utf16_bom));
+
+	pre = txt_find_sig_start(indata, filesize, utf16);
+	post = txt_find_sig_end(indata, filesize, utf16);
+	if (pre > 0 && post > 0) {
+		header->sigpos = pre;
+		header->siglen = post - pre;
+	} else {
+		header->sigpos = 0;
+		header->siglen = 0;
+	}
+
+	if (header->sigpos > 0 && header->sigpos < filesize && header->sigpos + header->siglen != filesize) {
+		printf("Corrupt powershell file - current signature not at end of file: %s\n", infile);
+		ret = 0; /* FAILED */
+	}
+	header->fileend = filesize;
+	return ret;
+}
+
+static int txt_calc_digest(char *indata, const EVP_MD *md, unsigned char *mdbuf, size_t offset)
+{
+	BIO *hash;
+	unsigned short *utf16_buf;
+	size_t utf16_len;
+	int ret = 0;
+
+	memset(mdbuf, 0, EVP_MAX_MD_SIZE);
+	hash = BIO_new(BIO_f_md());
+	BIO_set_md(hash, md);
+	BIO_push(hash, BIO_new(BIO_s_null()));
+
+	if (!txt_to_utf16(indata, offset, &utf16_buf, &utf16_len)) {
+		printf("Conversion to UTF 16 failed\n");
+		goto out;
+	}
+	if (!txt_hash(hash, utf16_buf, utf16_len)) {
+		printf("Hashing failed\n");
+		free(utf16_buf);
+		goto out;
+	}
+	free(utf16_buf);
+
+	BIO_gets(hash, (char*)mdbuf, EVP_MAX_MD_SIZE);
+	ret = 1;
+out:
+	BIO_free_all(hash);
+	return ret;
+}
+
+static int txt_verify_pkcs7(SIGNATURE *signature, char *indata, FILE_HEADER *header,
+			GLOBAL_OPTIONS *options)
+{
+	int ret = 1, mdok, mdtype = -1;
+	unsigned char mdbuf[EVP_MAX_MD_SIZE];
+	unsigned char cmdbuf[EVP_MAX_MD_SIZE];
+	char hexbuf[EVP_MAX_MD_SIZE*2+1];
+	const EVP_MD *md;
+
+	if (is_indirect_data_signature(signature->p7)) {
+		ASN1_STRING *astr = signature->p7->d.sign->contents->d.other->value.sequence;
+		const unsigned char *p = astr->data;
+		SpcIndirectDataContent *idc = d2i_SpcIndirectDataContent(NULL, &p, astr->length);
+		if (idc) {
+			if (idc->messageDigest && idc->messageDigest->digest && idc->messageDigest->digestAlgorithm) {
+				mdtype = OBJ_obj2nid(idc->messageDigest->digestAlgorithm->algorithm);
+				memcpy(mdbuf, idc->messageDigest->digest->data, idc->messageDigest->digest->length);
+			}
+			SpcIndirectDataContent_free(idc);
+		}
+	}
+	if (mdtype == -1) {
+		printf("Failed to extract current message digest\n\n");
+		goto out;
+	}
+	printf("Message digest algorithm  : %s\n", OBJ_nid2sn(mdtype));
+
+	md = EVP_get_digestbynid(mdtype);
+	tohex(mdbuf, hexbuf, EVP_MD_size(md));
+	printf("Current message digest    : %s\n", hexbuf);
+
+	txt_calc_digest(indata, md, cmdbuf, header->sigpos);
+
+	tohex(cmdbuf, hexbuf, EVP_MD_size(md));
+	mdok = !memcmp(mdbuf, cmdbuf, EVP_MD_size(md));
+	printf("Calculated message digest : %s%s\n\n", hexbuf, mdok ? "" : "    MISMATCH!!!");
+	if (!mdok) {
+		printf("Signature verification: failed\n\n");
+		goto out;
+	}
+
+	ret = verify_signature(signature, options);
+out:
+	if (!ret)
+		ERR_print_errors_fp(stdout);
+	return ret;
+}
+
+#if 0
+bool starts_with(const char *string, const char *prefix)
+{
+	if(strlen(prefix) > strlen(string))
+		return false;
+	return !memcmp(string, prefix, strlen(prefix));
+}
+
+static PKCS7 *powershell_extract_existing_pkcs7(const char *filename)
+{
+	char line[128];
+	BIO *mem, *b64, *file;
+	bool is_sig = false;
+	PKCS7 *pkcs7;
+
+	/* make a memory bio */
+	mem=BIO_new(BIO_s_mem());
+	if (!mem)
+		return NULL;
+	BIO_set_mem_eof_return(mem, BIO_NOCLOSE);
+
+	/* write base64 data from file to the memory bio */
+	file = BIO_new_file(filename, "r");
+	if (!file) {
+		printf("Failed to open %s\n", filename);
+		return NULL;
+	}
+	while (BIO_gets(file, line, sizeof line)) {
+		if(starts_with(line, "# SIG # Begin signature block")) {
+			is_sig=true;
+			continue;
+		}
+		if(starts_with(line, "# SIG # End signature block")) {
+			is_sig=false;
+			continue;
+		}
+		if(is_sig && line[0]=='#' && line[1]==' ')
+			BIO_puts(mem, line+2);
+	}
+	BIO_flush(mem);
+
+	/* push base64 encoder/decoder to the memory bio */
+	b64=BIO_new(BIO_f_base64());
+	if(!b64)
+		return NULL;
+	mem=BIO_push(b64, mem);
+
+	/* decode and return the result */
+	pkcs7=d2i_PKCS7_bio(mem, NULL);
+	BIO_free_all(mem);
+	return pkcs7;
+}
+#endif
+
+static PKCS7 *txt_extract_existing_pkcs7(char *data, size_t len, int utf16)
+{
+	size_t inc = 1 + ! !utf16;
+	BIO *bmem, *b64;
+	PKCS7 *p7;
+
+	len &= ~1;
+	/* skip two new lines */
+	while ((*data != '\n') && (len)) {
+		data += inc;
+		len -= inc;
+	}
+
+	data += inc;
+	len -= inc;
+	while ((*data != '\n') && (len)) {
+		data += inc;
+		len -= inc;
+	}
+
+	data += inc;
+	len -= inc;
+	len = txt_find_sig_end(data, len, utf16);
+	if (!len)
+		return NULL;
+
+	/* Right every valid character in data is now part of the base64 misery */
+	bmem = BIO_new(BIO_s_mem());
+	while (len) {
+		switch (*data) {
+		case ' ':
+		case '\n':
+		case '\r':
+		case '#':
+			break;
+		default:
+			BIO_write(bmem, data, 1);
+		}
+		data += inc;
+		len -= inc;
+	}
+	(void) BIO_flush (bmem);
+	b64 = BIO_new(BIO_f_base64());
+	bmem = BIO_push(b64, bmem);
+	BIO_set_flags(bmem, BIO_FLAGS_BASE64_NO_NL);
+	p7 = d2i_PKCS7_bio(bmem, NULL);
+	BIO_free_all(bmem);
+	return p7;
+}
+
+static int txt_verify_file(char *indata, FILE_HEADER *header, GLOBAL_OPTIONS *options)
+{
+	int i, ret = 1;
+	PKCS7 *p7;
+	STACK_OF(SIGNATURE) *signatures;
+	SIGNATURE *signature = NULL;
+	int utf16 = !memcmp(indata, utf16_bom, sizeof(utf16_bom));
+
+	signatures = sk_SIGNATURE_new_null();
+
+	if (header->siglen == 0) {
+		printf("No signature found\n\n");
+		goto out;
+	}
+
+	p7 = txt_extract_existing_pkcs7(indata + header->sigpos, header->siglen, utf16);
+	if (!p7) {
+		printf("Failed to extract PKCS7 data\n\n");
+		goto out;
+	}
+
+	if (!append_signature_list(&signatures, p7, 1)) {
+		printf("Failed to create signature list\n\n");
+		PKCS7_free(p7);
+		goto out;
+	}
+	for (i = 0; i < sk_SIGNATURE_num(signatures); i++) {
+		printf("Signature Index: %d %s\n", i, i==0 ? " (Primary Signature)" : "");
+		signature = sk_SIGNATURE_value(signatures, i);
+		ret &= txt_verify_pkcs7(signature, indata, header, options);
+		if (signature->timestamp) {
+			CMS_ContentInfo_free(signature->timestamp);
+			ERR_clear_error();
+		}
+		PKCS7_free(signature->p7);
+		OPENSSL_free(signature);
+	}
+	printf("Number of verified signatures: %d\n", i);
+out:
+	sk_SIGNATURE_free(signatures);
+	return ret;
+}
+
+static int txt_extract_file(char *indata, FILE_HEADER *header, BIO *outdata, int output_pkcs7)
+{
+	int ret = 0;
+	PKCS7 *sig;
+	int utf16 = !memcmp(indata, utf16_bom, sizeof(utf16_bom));
+
+	(void)BIO_reset(outdata);
+	if (output_pkcs7) {
+		sig = txt_extract_existing_pkcs7(indata + header->sigpos, header->siglen, utf16);
+		if (!sig) {
+			printf("Unable to extract existing signature\n");
+			return 1; /* FAILED */
+		}
+		ret = !PEM_write_bio_PKCS7(outdata, sig);
+		PKCS7_free(sig);
+	} else
+		/* TODO */
+		ret = !BIO_write(outdata, indata + header->sigpos, header->siglen);
+
+	return ret;
+}
+
+static int txt_modify_header(char *indata, FILE_HEADER *header, BIO *hash)
+{
+	unsigned short *utf16_buf;
+	size_t utf16_len;
+
+	if (!txt_to_utf16(indata, header->fileend, &utf16_buf, &utf16_len)) {
+		printf("Conversion to UTF 16 failed\n");
+		return 0; /* FAILED */
+	}
+	if (!txt_hash(hash, utf16_buf, utf16_len)) {
+		printf("Hashing failed\n");
+		return 0; /* FAILED */
+	}
+	free(utf16_buf);
+	return 1; /* OK */
+}
+
+static void squirt_utf16(BIO *bio, char *c, size_t len)
+{
+	short s;
+
+	while (len--) {
+		if (!*c)
+			return;
+
+		s = *(unsigned char *)c;
+		BIO_write (bio, &s, sizeof(s));
+		c++;
+	}
+}
+
+static void txt_write_signature(PKCS7 *sig, BIO *outdata)
+{
+	unsigned ll = 0;
+	char *pb = NULL;
+	size_t len;
+	BIO *b64 = BIO_new(BIO_f_base64());
+	BIO *bmem = BIO_new(BIO_s_mem());
+
+	BIO_push(b64, bmem);
+	BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+	i2d_PKCS7_bio(b64, sig);
+	(void)BIO_flush(b64);
+
+	squirt_utf16(outdata,"\r\n# SIG # Begin signature block\r\n",-1);
+	len = BIO_get_mem_data(bmem, &pb);
+	while (len--) {
+		if (isgraph(*pb)) {
+			if (ll==0)
+				squirt_utf16(outdata, "# ", 2);
+			squirt_utf16(outdata, pb, 1);
+			ll++;
+			if (ll==64) {
+				squirt_utf16(outdata, "\r\n", 2);
+				ll=0;
+			}
+		}
+		pb++;
+	}
+	if (ll)
+		squirt_utf16(outdata, "\r\n", 2);
+	squirt_utf16(outdata, "# SIG # End signature block\r\n", -1);
+	BIO_free_all (b64);
+}
+
+/*********************************************************/
+
 static void add_jp_attribute(PKCS7_SIGNER_INFO *si, int jp)
 {
 	ASN1_STRING *astr;
@@ -4500,7 +5064,7 @@ static int append_signature(PKCS7 *sig, PKCS7 *cursig, file_type_t type,
 	static char buf[64*1024];
 	PKCS7 *outsig = NULL;
 
-	if (type != FILE_TYPE_CAT && options->nest) {
+	if (options->nest && type != FILE_TYPE_CAT && type != FILE_TYPE_TXT) {
 		if (cursig == NULL) {
 			printf("Internal error: No 'cursig' was extracted\n");
 			return 1; /* FAILED */
@@ -4552,6 +5116,9 @@ static int append_signature(PKCS7 *sig, PKCS7 *cursig, file_type_t type,
 #endif
 	} else if (type == FILE_TYPE_CAT) {
 		i2d_PKCS7_bio(outdata, outsig);
+	} else if (type == FILE_TYPE_TXT) {
+		/* Write signature block in UTF16LE format */
+		txt_write_signature(sig, outdata);
 	}
 	OPENSSL_free(p);
 	return 0; /* OK */
@@ -4670,7 +5237,7 @@ static int input_validation(file_type_t type, GLOBAL_OPTIONS *options, FILE_HEAD
 	} else if (type == FILE_TYPE_CAT) {
 		if (options->nest)
 			/* I've not tried using pkcs7_set_nested_signature as signtool won't do this */
-			printf("Warning: CAT files do not support nesting\n");
+			printf("Warning: multiple signature support is not implemented for this filetype\n");
 		if (options->jp >= 0)
 			printf("Warning: -jp option is only valid for CAB files\n");
 		if (options->pagehash == 1)
@@ -4681,6 +5248,21 @@ static int input_validation(file_type_t type, GLOBAL_OPTIONS *options, FILE_HEAD
 #endif
 		if (!cat_verify_header(indata, filesize, header)) {
 			printf("Corrupt CAT file: %s\n", options->infile);
+			return 0; /* FAILED */
+		}
+	} else if (type == FILE_TYPE_TXT) {
+		if (options->nest == 1)
+			printf("Warning: multiple signature support is not implemented for this filetype\n");
+		if (options->jp >= 0)
+			printf("Warning: -jp option is only valid for CAB files\n");
+		if (options->pagehash == 1)
+			printf("Warning: -ph option is only valid for PE files\n");
+#ifdef WITH_GSF
+		if (options->add_msi_dse == 1)
+			printf("Warning: -add-msi-dse option is only valid for MSI files\n");
+#endif
+		if (!txt_verify_header(indata, options->infile, filesize, header)) {
+			printf("Corrupt text/powershell file\n");
 			return 0; /* FAILED */
 		}
 	} else if (type == FILE_TYPE_PE) {
@@ -4751,6 +5333,25 @@ static int check_attached_data(file_type_t type, FILE_HEADER *header, GLOBAL_OPT
 			printf("Signature mismatch\n");
 			return 1; /* FAILED */
 		}
+	} else if (type == FILE_TYPE_TXT) {
+			filesize = get_file_size(options->outfile);
+			if (!filesize) {
+				printf("Error verifying result\n");
+				return 1; /* FAILED */
+			}
+			outdata = map_file(options->outfile, filesize);
+			if (!outdata) {
+				printf("Error verifying result\n");
+				return 1; /* FAILED */
+			}
+			if (!txt_verify_header(outdata, options->outfile, filesize, header)) {
+				printf("Corrupt CAB file\n");
+				return 1; /* FAILED */
+			}
+			if (txt_verify_file(outdata, header, options)) {
+				printf("Signature mismatch\n");
+				return 1; /* FAILED */
+			}
 	} else if (type == FILE_TYPE_MSI) {
 #ifdef WITH_GSF
 		GsfInput *src;
@@ -4782,7 +5383,7 @@ static int check_attached_data(file_type_t type, FILE_HEADER *header, GLOBAL_OPT
 	return 0; /* OK */
 }
 
-static int get_file_type(char *indata, char *infile, file_type_t *type)
+static int get_file_type(char *indata, size_t len, char *infile, file_type_t *type)
 {
 	static u_char msi_signature[] = {
 		0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1
@@ -4803,6 +5404,18 @@ static int get_file_type(char *indata, char *infile, file_type_t *type)
 #endif
 	} else if (!memcmp(indata+4, pkcs7_signed_data, sizeof(pkcs7_signed_data))) {
 		*type = FILE_TYPE_CAT;
+	} else if (!memcmp(indata, utf8_bom, sizeof(utf8_bom))) {
+		printf("UTF-8 (BOM) EF BB BF\n");
+		*type = FILE_TYPE_TXT;
+	} else if (!memcmp(indata, utf16_bom, sizeof(utf16_bom))) {
+		printf("UTF-16LE (BOM) FF FE\n");
+		*type = FILE_TYPE_TXT;
+	} else if (is_txt(indata, len)) {
+		printf("UTF-8 text\n");
+		*type = FILE_TYPE_TXT;
+	} else if (is_utf16_txt(indata, len)) {
+		printf("UTF-16 text\n");
+		*type = FILE_TYPE_TXT;
 	} else {
 		printf("Unrecognized file type: %s\n", infile);
 		return 0; /* FAILED */
@@ -5484,6 +6097,43 @@ static PKCS7 *cat_presign_file(file_type_t type, cmd_type_t cmd, FILE_HEADER *he
 	return sig; /* OK */
 }
 
+static PKCS7 *txt_presign_file(file_type_t type, cmd_type_t cmd, FILE_HEADER *header,
+			GLOBAL_OPTIONS *options, CRYPTO_PARAMS *cparams, char *indata,
+			BIO *hash, BIO *outdata, PKCS7 **cursig)
+{
+	PKCS7 *sig = NULL;
+	int utf16 = !memcmp(indata, utf16_bom, sizeof(utf16_bom));
+
+	/* Obtain a current signature from previously-signed file */
+	if (header->sigpos && (options->nest || cmd == CMD_ADD)) {
+		*cursig = txt_extract_existing_pkcs7(indata + header->sigpos, header->siglen, utf16);
+		if (!*cursig) {
+			printf("Unable to extract existing signature\n");
+			return NULL; /* FAILED */
+		}
+		if (cmd == CMD_ADD)
+			sig = *cursig;
+	}
+
+	if (header->sigpos) {
+		/* Strip current signature */
+		header->fileend = header->sigpos;
+	}
+	if (!txt_modify_header(indata, header, hash))
+		return NULL;
+
+	/* Preserve the input format
+	(void)BIO_reset(outdata);
+	BIO_write(outdata, indata, header->fileend); */
+
+	/* Obtain an existing signature or create a new one */
+	if ((cmd == CMD_ATTACH) || (cmd == CMD_SIGN))
+		sig = get_pkcs7(cmd, hash, type, indata, options, header, cparams, NULL);
+	return sig; /* OK */
+}
+
+/*********************************************************/
+
 static void print_version()
 {
 	printf(PACKAGE_STRING ", using:\n\t%s (Library: %s)\n\t%s\n",
@@ -5504,6 +6154,11 @@ static void print_version()
 		"\tno libgsf available\n"
 #endif /* WITH_GSF */
 		);
+	printf("\tsupported file types: cab cat "
+#ifdef WITH_GSF
+		"msi "
+#endif
+		"pe txt(ps1)\n");
 	printf("\nPlease send bug-reports to " PACKAGE_BUGREPORT "\n\n");
 }
 
@@ -5799,7 +6454,7 @@ int main(int argc, char **argv)
 	memset(&gsfparams, 0, sizeof(GSF_PARAMS));
 #endif /* WITH_GSF */
 
-	if (!get_file_type(indata, options.infile, &type))
+	if (!get_file_type(indata, filesize, options.infile, &type))
 		goto err_cleanup;
 
 	hash = BIO_new(BIO_f_md());
@@ -5911,6 +6566,24 @@ int main(int argc, char **argv)
 		} else {
 			sig = cat_presign_file(type, cmd, &header, &options, &cparams, indata, &cursig);
 			if (!sig)
+				goto err_cleanup;
+		}
+	} else if (type == FILE_TYPE_TXT) {
+		if ((cmd == CMD_REMOVE || cmd == CMD_EXTRACT) && header.sigpos == 0) {
+			DO_EXIT_1("TXT file does not have any signature: %s\n", options.infile);
+		} else if (cmd == CMD_EXTRACT) {
+			ret = txt_extract_file(indata, &header, outdata, options.output_pkcs7);
+			goto skip_signing;
+		} else if (cmd == CMD_VERIFY) {
+			ret = txt_verify_file(indata, &header, &options);
+			goto skip_signing;
+		} else {
+			sig = txt_presign_file(type, cmd, &header, &options, &cparams, indata,
+				hash, outdata, &cursig);
+			if (cmd == CMD_REMOVE) {
+				ret = 0; /* OK */
+				goto skip_signing;
+			} else if (!sig)
 				goto err_cleanup;
 		}
 	}

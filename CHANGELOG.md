@@ -1,5 +1,7 @@
 ### 2.2 (unreleased)
 
+- TXT files (PowerShell scripts) support
+  (Thanks to James McKenzie)
 - CAT files support
   (Thanks to James McKenzie)
 
