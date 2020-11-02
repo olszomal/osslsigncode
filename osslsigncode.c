@@ -88,6 +88,7 @@ typedef unsigned char u_char;
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <iconv.h>
 
 #ifndef _WIN32
 #ifdef HAVE_SYS_MMAN_H

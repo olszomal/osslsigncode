@@ -74,6 +74,12 @@ AC_CHECK_LIB(
 	[DL_LIBS="-ldl"]
 )
 
+AC_CHECK_LIB(
+	[iconv],
+	[iconv_open],
+	[ICONV_LIBS="-liconv"]
+)
+
 AC_CHECK_HEADERS([termios.h])
 AC_CHECK_FUNCS(getpass)
 
@@ -131,6 +137,7 @@ fi
 
 AC_SUBST([OPTIONAL_LIBCURL_CFLAGS])
 AC_SUBST([OPTIONAL_LIBCURL_LIBS])
+AC_SUBST([ICONV_LIBS])
 
 AC_DEFINE_UNQUOTED([CA_BUNDLE_PATH], ["$(curl-config --ca 2>/dev/null)"], [CA bundle install path])
 
